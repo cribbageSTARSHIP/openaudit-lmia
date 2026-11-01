@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz, process, utils
 import structlog
 
 logger = structlog.get_logger()
@@ -95,7 +95,12 @@ def process_esdc_data(csv_path: str, conn):
             candidates = job_listings_db[noc]
             employer_names = [c["employer"] for c in candidates]
 
-            best_match = process.extractOne(employer, employer_names, scorer=fuzz.token_sort_ratio)
+            best_match = process.extractOne(
+                employer,
+                employer_names,
+                scorer=fuzz.token_sort_ratio,
+                processor=utils.default_process,
+            )
 
             if best_match and best_match[1] >= FUZZY_MATCH_THRESHOLD:
                 matched_index = best_match[2]
