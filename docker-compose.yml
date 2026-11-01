@@ -1,0 +1,55 @@
+services:
+  # ---------------------------------------------------------
+  # Core Database: PostgreSQL for Job Bank ads & applicants
+  # ---------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: openaudit-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openaudit
+      POSTGRES_USER: openaudit_user
+      POSTGRES_PASSWORD: openaudit_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openaudit_user -d openaudit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------
+  # Local Inference Node: Ollama for private NOC matching
+  # ---------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: openaudit-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  # ---------------------------------------------------------
+  # Ingestion Engine: Python / Playwright Job Bank Scraper
+  # ---------------------------------------------------------
+  scraper:
+    build:
+      context: ./services/scraper
+      dockerfile: Dockerfile
+    container_name: openaudit-scraper
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://openaudit_user:openaudit_password@db:5432/openaudit
+      POLL_INTERVAL_HOURS: "6"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./services/scraper:/app
+
+volumes:
+  db_data:
+  ollama_data:
