@@ -1,5 +1,8 @@
 import asyncio
+import os
 import re
+import psycopg2
+from psycopg2.extras import execute_values
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Browser, Page
@@ -63,7 +66,7 @@ async def parse_job_details(page: Page, url: str, fallback_id: str) -> Optional[
         raw_wage = (await wage_el.inner_text()).strip() if wage_el else None
         wage = " ".join(raw_wage.replace("Salary", "").split()) if raw_wage else None
 
-        # 6. NOC Code (search anchors linking to NOC trend analysis or NOC patterns)
+        # 6. NOC Code
         noc_code = None
         noc_link = await page.query_selector("a[href*='/noc/'], a[href*='noc=']")
         if noc_link:
@@ -74,7 +77,6 @@ async def parse_job_details(page: Page, url: str, fallback_id: str) -> Optional[
 
         if not noc_code:
             page_content = await page.content()
-            # Match 4 or 5 digit NOC codes often prefixed by NOC or NOC 2021
             noc_match = re.search(r"NOC\s*(?:2021|2016)?\s*[:#-]?\s*(\d{4,5})", page_content, re.IGNORECASE)
             if noc_match:
                 noc_code = noc_match.group(1)
@@ -97,7 +99,6 @@ async def parse_job_details(page: Page, url: str, fallback_id: str) -> Optional[
             if email_match:
                 email = email_match.group(1)
 
-        # Fallback mailto search across full page DOM
         if not email:
             full_html = await page.content()
             mailto_match = re.search(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", full_html)
@@ -135,7 +136,6 @@ async def run_scraper(limit: int = 10) -> List[JobListing]:
         await page.goto(JOB_BANK_SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_selector("article, a.resultJobItem", timeout=15000)
 
-        # Retrieve card elements
         articles = await page.query_selector_all("article")
         job_targets = []
 
@@ -143,12 +143,10 @@ async def run_scraper(limit: int = 10) -> List[JobListing]:
             if len(job_targets) >= limit:
                 break
 
-            # Try to grab ID from article id (e.g. article-43892104)
             art_id = await art.get_attribute("id") or ""
             id_match = re.search(r"(\d{7,9})", art_id)
             card_id = id_match.group(1) if id_match else "unknown"
 
-            # Grab the link
             link_el = await art.query_selector("a.resultJobItem, a")
             if link_el:
                 href = await link_el.get_attribute("href") or ""
@@ -161,7 +159,6 @@ async def run_scraper(limit: int = 10) -> List[JobListing]:
 
         logger.info("found_listings", count=len(job_targets))
 
-        # Parse each target detail page
         for fallback_id, url in job_targets:
             listing = await parse_job_details(page, url, fallback_id)
             if listing:
@@ -181,10 +178,58 @@ async def run_scraper(limit: int = 10) -> List[JobListing]:
     return results
 
 
+def save_to_db(listings: List[JobListing]):
+    """Upserts job listings into the PostgreSQL database."""
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        logger.warning("no_database_url_found_skipping_insert")
+        return
+
+    try:
+        conn = psycopg2.connect(db_url)
+        cursor = conn.cursor()
+
+        query = """
+            INSERT INTO job_listings (
+                job_id, title, employer, location, wage, 
+                noc_code, posting_url, is_lmia_flagged, how_to_apply_email
+            ) VALUES %s
+            ON CONFLICT (job_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                employer = EXCLUDED.employer,
+                location = EXCLUDED.location,
+                wage = EXCLUDED.wage,
+                noc_code = EXCLUDED.noc_code,
+                how_to_apply_email = EXCLUDED.how_to_apply_email,
+                is_lmia_flagged = EXCLUDED.is_lmia_flagged;
+        """
+
+        values = [
+            (
+                r.job_id, r.title, r.employer, r.location, r.wage,
+                r.noc_code, r.posting_url, r.is_lmia_flagged, r.how_to_apply_email
+            )
+            for r in listings if r.job_id != "unknown"
+        ]
+
+        if values:
+            execute_values(cursor, query, values)
+            conn.commit()
+            logger.info("database_upsert_successful", records_saved=len(values))
+        else:
+            logger.warning("no_valid_records_to_save")
+
+    except Exception as e:
+        logger.error("database_upsert_failed", error=str(e))
+    finally:
+        if 'conn' in locals() and conn:
+            cursor.close()
+            conn.close()
+
+
 if __name__ == "__main__":
     records = asyncio.run(run_scraper(limit=10))
+    save_to_db(records)
     print("\n==========================================")
-    print(f"Successfully parsed {len(records)} LMIA listings:")
+    print(f"Successfully scraped and saved {len(records)} LMIA listings.")
     print("==========================================")
-    for r in records:
-        print(f"[{r.job_id}] {r.title} | Employer: {r.employer} | Loc: {r.location} | NOC: {r.noc_code} | Email: {r.how_to_apply_email}")
