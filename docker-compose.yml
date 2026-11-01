@@ -60,6 +60,24 @@ services:
     volumes:
       - ./services/scraper:/app
 
+  # ---------------------------------------------------------
+  # Reconciler Engine: Matches Job Bank IDs to ESDC CSVs
+  # ---------------------------------------------------------
+  reconciler:
+    build:
+      context: ./services/reconciler
+      dockerfile: Dockerfile
+    container_name: openaudit-reconciler
+    environment:
+      DATABASE_URL: postgres://openaudit_user:openaudit_password@db:5432/openaudit
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./services/reconciler:/app
+      # Mount a local folder called 'data' so we can drop ESDC CSVs into it
+      - ./data:/app/data
+
 volumes:
   db_data:
   ollama_data:
