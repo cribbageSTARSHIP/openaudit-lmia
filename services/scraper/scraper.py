@@ -26,20 +26,19 @@ async def parse_job_details(page: Page, url: str, fallback_id: str) -> Optional[
     """Extracts detailed metadata from an individual Job Bank listing page."""
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(1000)
 
-        # 1. Job Bank ID: Prefer card-extracted ID, fallback to DOM or URL match
+        # 1. Job Bank ID extraction
         job_id = fallback_id
-        if job_id == "unknown":
-            match = re.search(r"jobposting/(\d+)", page.url)
+        if not job_id or job_id == "unknown":
+            match = re.search(r"(\d{7,9})", page.url)
             if match:
                 job_id = match.group(1)
             else:
-                id_el = await page.query_selector("span[property='identifier'], span#jobpostid")
-                if id_el:
-                    id_text = await id_el.inner_text()
-                    id_match = re.search(r"\d+", id_text)
-                    if id_match:
-                        job_id = id_match.group(0)
+                body_text = await page.inner_text("body")
+                id_match = re.search(r"(?:Job Bank\s*(?:job\s*posting)?\s*#?|Job\s*#)\s*(\d{7,9})", body_text, re.IGNORECASE)
+                if id_match:
+                    job_id = id_match.group(1)
 
         # 2. Title
         title_el = await page.query_selector("h1 span[property='title'], h1.title, h1 span[itemprop='title']")
@@ -64,39 +63,46 @@ async def parse_job_details(page: Page, url: str, fallback_id: str) -> Optional[
         raw_wage = (await wage_el.inner_text()).strip() if wage_el else None
         wage = " ".join(raw_wage.replace("Salary", "").split()) if raw_wage else None
 
-        # 6. NOC Code: Check occupationalCategory attribute and job-overview metadata
+        # 6. NOC Code (search anchors linking to NOC trend analysis or NOC patterns)
         noc_code = None
-        noc_el = await page.query_selector("[property='occupationalCategory'], li:has-text('NOC')")
-        if noc_el:
-            noc_text = await noc_el.inner_text()
-            noc_match = re.search(r"\b(\d{4,5})\b", noc_text)
+        noc_link = await page.query_selector("a[href*='/noc/'], a[href*='noc=']")
+        if noc_link:
+            href = await noc_link.get_attribute("href") or ""
+            noc_match = re.search(r"\b(\d{4,5})\b", href)
             if noc_match:
                 noc_code = noc_match.group(1)
 
-        # 7. Contact / Apply Email: Click drawer and explicitly wait for AJAX render
+        if not noc_code:
+            page_content = await page.content()
+            # Match 4 or 5 digit NOC codes often prefixed by NOC or NOC 2021
+            noc_match = re.search(r"NOC\s*(?:2021|2016)?\s*[:#-]?\s*(\d{4,5})", page_content, re.IGNORECASE)
+            if noc_match:
+                noc_code = noc_match.group(1)
+
+        # 7. Contact / Apply Email
         email = None
-        how_to_apply_btn = await page.query_selector("#howtoapply")
+        how_to_apply_btn = await page.query_selector("#howtoapply, button[aria-controls='howtoapplyDiv'], a#howtoapply")
         if how_to_apply_btn:
             try:
+                await how_to_apply_btn.scroll_into_view_if_needed()
                 await how_to_apply_btn.click()
-                # Wait for Job Bank's AJAX container to populate
-                await page.wait_for_selector("#howtoapplyDiv, #howtoapplyContent", timeout=4000)
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(2000)
             except Exception:
                 pass
 
-        apply_content = await page.query_selector("#howtoapplyDiv, #howtoapplyContent, div.howtoapply")
-        if apply_content:
-            apply_text = await apply_content.inner_text()
-            email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", apply_text)
-            if email_match:
-                email = email_match.group(0)
-
-        if not email:
-            page_src = await page.content()
-            email_match = re.search(r"mailto:([\w\.-]+@[\w\.-]+\.\w+)", page_src)
+        apply_container = await page.query_selector("#howtoapplyDiv, #howtoapplyContent, div.howtoapply")
+        if apply_container:
+            apply_text = await apply_container.inner_text()
+            email_match = re.search(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", apply_text)
             if email_match:
                 email = email_match.group(1)
+
+        # Fallback mailto search across full page DOM
+        if not email:
+            full_html = await page.content()
+            mailto_match = re.search(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", full_html)
+            if mailto_match:
+                email = mailto_match.group(1)
 
         return JobListing(
             job_id=job_id,
@@ -127,25 +133,35 @@ async def run_scraper(limit: int = 10) -> List[JobListing]:
 
         logger.info("navigating_to_job_bank", url=JOB_BANK_SEARCH_URL)
         await page.goto(JOB_BANK_SEARCH_URL, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_selector("article, a.resultJobItem", timeout=15000)
 
-        # Locate job card links
-        cards = await page.query_selector_all("article a.resultJobItem, a.resultJobItem")
+        # Retrieve card elements
+        articles = await page.query_selector_all("article")
         job_targets = []
 
-        for card in cards:
+        for art in articles:
             if len(job_targets) >= limit:
                 break
-            href = await card.get_attribute("href")
-            if href:
-                full_url = f"https://www.jobbank.gc.ca{href}" if href.startswith("/") else href
-                # Job Bank card hrefs look like: /jobsearch/jobposting/43892104;jsessionid=... or ?source=...
-                match = re.search(r"jobposting/(\d+)", full_url)
-                extracted_id = match.group(1) if match else "unknown"
-                job_targets.append((extracted_id, full_url))
+
+            # Try to grab ID from article id (e.g. article-43892104)
+            art_id = await art.get_attribute("id") or ""
+            id_match = re.search(r"(\d{7,9})", art_id)
+            card_id = id_match.group(1) if id_match else "unknown"
+
+            # Grab the link
+            link_el = await art.query_selector("a.resultJobItem, a")
+            if link_el:
+                href = await link_el.get_attribute("href") or ""
+                if "/jobposting/" in href or "/jobsearch/jobposting" in href:
+                    full_url = f"https://www.jobbank.gc.ca{href}" if href.startswith("/") else href
+                    if card_id == "unknown":
+                        url_match = re.search(r"jobposting/(\d{7,9})", full_url)
+                        card_id = url_match.group(1) if url_match else "unknown"
+                    job_targets.append((card_id, full_url))
 
         logger.info("found_listings", count=len(job_targets))
 
-        # Parse listings
+        # Parse each target detail page
         for fallback_id, url in job_targets:
             listing = await parse_job_details(page, url, fallback_id)
             if listing:
